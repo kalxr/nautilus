@@ -34,6 +34,7 @@
 #ifdef NAUT_CONFIG_ENABLE_REMOTE_DEBUGGING
 #include <nautilus/gdb-stub.h>
 #endif
+#include <nautilus/timehook.h>
 
 #ifndef NAUT_CONFIG_DEBUG_PS2
 #undef DEBUG_PRINT
@@ -510,6 +511,61 @@ kbd_handler (excp_entry_t * excp, excp_vec_t vec, void *state)
   return 0;
 }
 
+// BLENDER - keyboard callback function
+// Should have similar functionality to kbd_handler
+__attribute__((annotate("nohook"))) int kbd_callback ()
+{
+  DEBUG("I'm a giraffe\n");
+  
+  uint8_t status;
+  nk_scancode_t scan;
+  uint8_t key;
+  uint8_t flag;
+  
+  status = inb(KBD_CMD_REG);
+
+  io_delay();
+
+  if ((status & STATUS_OUTPUT_FULL) != 0) {
+    scan  = inb(KBD_DATA_REG);
+    DEBUG("Keyboard: status=0x%x, scancode=0x%x\n", status, scan);
+    io_delay();
+    
+#if NAUT_CONFIG_THREAD_EXIT_KEYCODE == 0xc4
+    // Vestigal debug handling to force thread exit
+    if (scan == 0xc4) {
+      void * ret = NULL;
+      ps2_kbd_reset();
+      nk_thread_exit(ret);
+    }
+#endif
+
+#ifdef NAUT_CONFIG_ENABLE_REMOTE_DEBUGGING
+    if (scan == 0x42) {
+      // F8 down - stop
+        nk_gdb_handle_exception(excp, vec, 0, (void *)0x1ULL);
+      // now ignore the key
+      goto out;
+    }
+    if (scan == 0xc2) {
+      // F8 up - ignore the key
+      goto out;
+    }
+#endif
+    
+    switcher(scan);
+
+    goto out; // to avoid label warning
+    
+  }
+
+ out:
+
+  return 0;
+}
+
+
+
 /***************************************************************
     MOUSE
 ****************************************************************/
@@ -753,8 +809,14 @@ int ps2_init(struct naut_info * naut)
   } else {
     if (rc==HAVE_KEYBOARD || rc == HAVE_KEYBOARD_AND_MOUSE) { 
       nk_dev_register("ps2-keyboard",NK_DEV_GENERIC,0,&kops,0);
+      // BLENDER - disable keyboard interrupts
       register_irq_handler(1, kbd_handler, NULL);
       nk_unmask_irq(1);
+
+      // Now we need to register our callback function with time_hook
+      // uint64_t gran = nk_time_hook_get_granularity_ns();
+      // uint64_t scale = 300000; // 300,000 ~100us
+      // nk_time_hook_register(kbd_callback, 0, gran * scale, NK_TIME_HOOK_THIS_CPU, 0);
     } 
     if (rc==HAVE_KEYBOARD_AND_MOUSE) { 
       nk_dev_register("ps2-mouse",NK_DEV_GENERIC,0,&mops,0);

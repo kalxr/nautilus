@@ -25,6 +25,8 @@
 #include <nautilus/blkdev.h>
 #include <dev/ata.h>
 
+#include <nautilus/timehook.h>
+
 #ifndef NAUT_CONFIG_DEBUG_ATA
 #undef DEBUG_PRINT
 #define DEBUG_PRINT(fmt, args...) 
@@ -264,6 +266,306 @@ static int ata_drive_identify(struct ata_blkdev_state *s)
     }
 }
 
+
+// BLENDER - this is where the important stuff happens
+
+struct hook_state {
+    struct ata_blkdev_state *blk_state;
+    struct nk_time_hook *uh;
+    void (*callback)(nk_block_dev_status_t, void *);
+    void *context;
+    uint64_t block_num;
+    uint64_t count; 
+    uint8_t  *srcdest; 
+    int write;
+
+    uint64_t i;
+};
+
+__attribute__((annotate("nohook"))) static int ata_wait_blender_one(void *state)
+{
+    DEBUG("Entered function ata_wait_blender_one\n");
+    // lock?
+    // in here we need to increment uh-> i until its equal to count, then unregister ourselves
+    STATE_LOCK_CONF;
+
+    struct hook_state *hs = (struct hook_state *)state;
+    struct ata_blkdev_state *s = hs->blk_state;
+
+    STATE_LOCK(s);
+
+    uint8_t devnum = s->channel * 2 + s->id;
+    ata_status_reg_t stat;
+    
+    DEBUG("Waiting on drive %u for %s\n",devnum,"data");
+
+    stat.val = inb(CMDSTATUS(devnum));
+    if (stat.err) { 
+        ERROR("Controller error (0x%x)\n",stat.val);
+        ata_reset(s);
+        // unlock?
+        nk_time_hook_unregister(hs->uh);
+        STATE_UNLOCK(s);
+        free(hs);
+        // return ERR;
+        return -1;
+    }
+    if (stat.df) { 
+        ERROR("Drive fault (0x%x)\n",stat.val);
+        ata_reset(s);
+        // unlock?
+        nk_time_hook_unregister(hs->uh);
+        STATE_UNLOCK(s);
+        free(hs);
+        // return DF;
+        return -1;
+    }
+    if (!stat.bsy && stat.drq) { 
+        DEBUG("Leaving wait with status=0x%x\n",stat.val);
+
+        uint64_t j;
+
+        for (j=0;j<256;j++) {
+            uint16_t cur;
+            if (hs->write) { 
+                cur = *((uint16_t *)(hs->srcdest + hs->i * 512 + j * 2));
+                // DEBUG("Writing 0x%04x\n", cur);
+                outw(cur,DATA(devnum));
+            } else {
+                cur = inw(DATA(devnum));
+                // DEBUG("Read 0x%04x\n",cur);
+                *((uint16_t *)(hs->srcdest + hs->i * 512 + j * 2)) = cur;
+            }
+        }
+        hs->i = hs->i + 1;
+        STATE_UNLOCK(s);
+        if (hs->i >= hs->count) {
+            nk_time_hook_unregister(hs->uh);
+            if (hs->callback) {
+                hs->callback(NK_BLOCK_DEV_STATUS_SUCCESS, hs->context);
+            }
+            free(hs);
+        }
+        
+        // return OK;
+        return 0;
+    }
+    STATE_UNLOCK(s);
+
+    return 0;
+}
+
+__attribute__((annotate("nohook"))) static int ata_lba48_read_write_blender_one(void *state)
+{
+    DEBUG("Entered function ata_lba48_read_write_blender_one\n");
+
+    // no lock, only called from ata_wait_blender_zero which already locks
+
+    struct hook_state *hs = (struct hook_state *)state;
+    uint64_t block_num = hs->block_num;
+    uint64_t count = hs->count; 
+    uint8_t  *srcdest = hs->srcdest; 
+    int write = hs->write;
+    struct ata_blkdev_state *s = hs->blk_state;
+
+
+    uint64_t atacount;
+    uint8_t devnum = s->channel * 2 + s->id;
+    uint8_t sectcnt[2];
+    uint8_t lba[7]; // we use 1..6 as per convention...
+
+    DEBUG("%s on device %u start %lu numblocks %lu\n",
+	  write ? "write" : "read",
+	  devnum, block_num, count);
+ 
+    // count is encoded with 0 == 64K sectors
+    if (count==65536) { 
+	    atacount=0;
+    } else {
+	    atacount=count;
+    }
+
+    DEBUG("atacount=%lu\n",atacount);
+ 
+    sectcnt[1] = (atacount>>8) & 0xff;
+    sectcnt[0] = atacount & 0xff;
+
+    lba[6] = (block_num >> 40) & 0xff;
+    lba[5] = (block_num >> 32) & 0xff;
+    lba[4] = (block_num >> 24) & 0xff;
+    lba[3] = (block_num >> 16) & 0xff;
+    lba[2] = (block_num >>  8) & 0xff;
+    lba[1] = (block_num >>  0) & 0xff;
+
+    outb(0x40 | (s->id << 4), DRIVEHEAD(devnum));
+    outb(sectcnt[1],SECTCOUNT(devnum));
+    outb(lba[4],LBALO(devnum));
+    outb(lba[5],LBAMID(devnum));
+    outb(lba[6],LBAHI(devnum));
+    outb(sectcnt[0],SECTCOUNT(devnum));
+    outb(lba[1],LBALO(devnum));
+    outb(lba[2],LBAMID(devnum));
+    outb(lba[3],LBAHI(devnum));
+
+    DEBUG("LBA and sector count completed\n");
+ 
+    uint64_t i,j;
+
+    if (write) { 
+	    outb(0x34,CMDSTATUS(devnum)); // WRITE SECTORS EXT
+    } else {
+	    outb(0x24,CMDSTATUS(devnum)); // READ SECTORS EXT
+    }
+    
+    DEBUG("Command intiatiated - handling data\n");    
+
+    hs->i = 0;
+    uint64_t gran = nk_time_hook_get_granularity_ns();
+    uint64_t scale = 1000;
+    hs->uh = nk_time_hook_register(ata_wait_blender_one, hs, gran * scale, NK_TIME_HOOK_THIS_CPU, 0);
+
+    DEBUG("Completed successfully\n");
+    return 0;
+
+}
+
+__attribute__((annotate("nohook"))) static int ata_wait_blender_zero(void *state)
+{
+    DEBUG("Entered function ata_wait_blender_zero\n");
+    // lock?
+    STATE_LOCK_CONF;
+
+    struct hook_state *hs = (struct hook_state *)state;
+    struct ata_blkdev_state *s = hs->blk_state;
+
+    STATE_LOCK(s);
+
+    uint8_t devnum = s->channel * 2 + s->id;
+    ata_status_reg_t stat;
+    
+    DEBUG("Waiting on drive %u for %s\n",devnum,"command");
+
+    stat.val = inb(CMDSTATUS(devnum));
+    if (stat.err) { 
+        ERROR("Controller error (0x%x)\n",stat.val);
+        ata_reset(s);
+        // unlock?
+        nk_time_hook_unregister(hs->uh);
+        free(hs);
+        STATE_UNLOCK(s);
+        // return ERR;
+        return -1;
+    }
+    if (stat.df) { 
+        ERROR("Drive fault (0x%x)\n",stat.val);
+        ata_reset(s);
+        // unlock?
+        nk_time_hook_unregister(hs->uh);
+        free(hs);
+        STATE_UNLOCK(s);
+        // return DF;
+        return -1;
+    }
+    if (!stat.bsy) { 
+        DEBUG("Leaving wait with status=0x%x\n",stat.val);
+        // unlock?
+        nk_time_hook_unregister(hs->uh);
+        ata_lba48_read_write_blender_one(hs);
+        STATE_UNLOCK(s);
+        // return OK;
+        return 0;
+    }
+    STATE_UNLOCK(s);
+    // return OK;
+    return 0;
+}
+
+__attribute__((annotate("nohook"))) static int ata_lba48_read_write_blender_zero(struct ata_blkdev_state *s,
+				 uint64_t block_num, 
+				 uint64_t count, 
+				 uint8_t  *srcdest, 
+				 int write,
+                 void (*callback)(nk_block_dev_status_t, void *),
+                 void *context)
+{
+
+    DEBUG("Entered function ata_lba48_read_write_blender_zero\n");
+
+    uint64_t gran = nk_time_hook_get_granularity_ns();
+    uint64_t scale = 1000;
+
+    struct hook_state* hs = malloc(sizeof(struct hook_state));
+    hs->blk_state = s;
+    hs->callback = callback;
+    hs->context = context;
+    hs->block_num = block_num;
+    hs->count = count;
+    hs->srcdest = srcdest;
+    hs->write = write;
+    hs->uh = nk_time_hook_register(ata_wait_blender_zero, hs, gran * scale, NK_TIME_HOOK_THIS_CPU, 0);
+    
+    DEBUG("ata_lba48_read_write_blender first wait hook set\n");
+    return 0;
+
+}
+
+#define BLEND
+
+#ifdef BLEND
+
+// These two are the interface to the outside world
+// For actual implementation these should be named read_blocks and write_blocks,
+// but to avoid conflicts and because I don't want to use macros yet put them like this
+
+static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *dest,void (*callback)(nk_block_dev_status_t, void *), void *context)
+{
+    // return 0;
+    // STATE_LOCK_CONF;
+    struct ata_blkdev_state *s = (struct ata_blkdev_state *)state;
+
+    DEBUG("read_blocks on device %s starting at %lu for %lu blocks\n",
+	  s->blkdev->dev.name, blocknum, count);
+
+    // STATE_LOCK(s);
+    if (blocknum+count >= s->num_blocks) { 
+        // STATE_UNLOCK(s);
+        ERROR("Illegal access past end of disk\n");
+        return -1;
+    } else {
+        // STATE_UNLOCK(s);
+        int rc = ata_lba48_read_write_blender_zero(s, blocknum, count, dest, 0, callback, context);
+	return rc;
+    }
+}
+
+static int write_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *src,void (*callback)(nk_block_dev_status_t, void *), void *context)
+{
+    // return 0;
+    STATE_LOCK_CONF;
+    struct ata_blkdev_state *s = (struct ata_blkdev_state *)state;
+
+    DEBUG("write_blocks on device %s starting at %lu for %lu blocks\n",
+	  s->blkdev->dev.name, blocknum, count);
+
+    STATE_LOCK(s);
+    if (blocknum+count >= s->num_blocks) { 
+        STATE_UNLOCK(s);
+        ERROR("Illegal access past end of disk\n");
+        return -1;
+    } else {
+        STATE_UNLOCK(s);
+        int rc = ata_lba48_read_write_blender_zero(s,blocknum, count, src, 1, callback, context);
+	return rc;
+    }
+}
+
+#endif
+
+
+//END BLENDER
+
+
+
 static int ata_lba48_read_write(struct ata_blkdev_state *s,
 				 uint64_t block_num, 
 				 uint64_t count, 
@@ -350,10 +652,10 @@ static int ata_lba48_read_write(struct ata_blkdev_state *s,
 
     DEBUG("Completed successfully\n");
     return 0;
-}	    
+}	
 
-	
 
+#ifndef BLEND
 
 static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *dest,void (*callback)(nk_block_dev_status_t, void *), void *context)
 {
@@ -383,6 +685,7 @@ static int write_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t 
     STATE_LOCK_CONF;
     struct ata_blkdev_state *s = (struct ata_blkdev_state *)state;
 
+    DEBUG("Is this even getting compiled???\n");
     DEBUG("write_blocks on device %s starting at %lu for %lu blocks\n",
 	  s->blkdev->dev.name, blocknum, count);
 
@@ -400,6 +703,8 @@ static int write_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t 
 	return rc;
     }
 }
+
+#endif
 
 static int get_characteristics(void *state, struct nk_block_dev_characteristics *c)
 {
