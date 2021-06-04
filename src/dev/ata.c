@@ -41,6 +41,8 @@
 #define STATE_LOCK(state) _state_lock_flags = spin_lock_irq_save(&state->lock)
 #define STATE_UNLOCK(state) spin_unlock_irq_restore(&(state->lock), _state_lock_flags)
 
+#define STATE_TRY_LOCK(state) spin_try_lock_irq_save(&(state->lock), &_state_lock_flags)
+
 
 /*
   This is a hideous first-pass implementation using PIO mode
@@ -284,19 +286,22 @@ struct hook_state {
 
 __attribute__((annotate("nohook"))) static int ata_wait_blender_one(void *state)
 {
-    DEBUG("Entered function ata_wait_blender_one\n");
-    // lock?
-    // in here we need to increment uh-> i until its equal to count, then unregister ourselves
     STATE_LOCK_CONF;
 
     struct hook_state *hs = (struct hook_state *)state;
     struct ata_blkdev_state *s = hs->blk_state;
 
-    STATE_LOCK(s);
+    if (STATE_TRY_LOCK(s)) {
+        return 0;
+    }    
+
+    DEBUG("Entered function ata_wait_blender_one\n");
+
+    // in here we need to increment uh-> i until its equal to count, then unregister ourselves
 
     uint8_t devnum = s->channel * 2 + s->id;
     ata_status_reg_t stat;
-    
+
     DEBUG("Waiting on drive %u for %s\n",devnum,"data");
 
     stat.val = inb(CMDSTATUS(devnum));
@@ -338,20 +343,24 @@ __attribute__((annotate("nohook"))) static int ata_wait_blender_one(void *state)
             }
         }
         hs->i = hs->i + 1;
-        STATE_UNLOCK(s);
+        
         if (hs->i >= hs->count) {
             nk_time_hook_unregister(hs->uh);
+            STATE_UNLOCK(s);
+            DEBUG("Operation complete! Issuing callback.\n");
             if (hs->callback) {
                 hs->callback(NK_BLOCK_DEV_STATUS_SUCCESS, hs->context);
             }
             free(hs);
+            return 0;
         }
         
+        STATE_UNLOCK(s);
         // return OK;
         return 0;
     }
     STATE_UNLOCK(s);
-
+    
     return 0;
 }
 
@@ -367,7 +376,6 @@ __attribute__((annotate("nohook"))) static int ata_lba48_read_write_blender_one(
     uint8_t  *srcdest = hs->srcdest; 
     int write = hs->write;
     struct ata_blkdev_state *s = hs->blk_state;
-
 
     uint64_t atacount;
     uint8_t devnum = s->channel * 2 + s->id;
@@ -431,14 +439,18 @@ __attribute__((annotate("nohook"))) static int ata_lba48_read_write_blender_one(
 
 __attribute__((annotate("nohook"))) static int ata_wait_blender_zero(void *state)
 {
-    DEBUG("Entered function ata_wait_blender_zero\n");
-    // lock?
+    // We should use some kind of try-lock at the very start here to prevent deadlock
     STATE_LOCK_CONF;
 
     struct hook_state *hs = (struct hook_state *)state;
     struct ata_blkdev_state *s = hs->blk_state;
 
-    STATE_LOCK(s);
+    if (STATE_TRY_LOCK(s)) {
+        return 0;
+    }
+    
+    DEBUG("Entered function ata_wait_blender_zero\n");
+    DEBUG("potato\n");
 
     uint8_t devnum = s->channel * 2 + s->id;
     ata_status_reg_t stat;
@@ -488,6 +500,7 @@ __attribute__((annotate("nohook"))) static int ata_lba48_read_write_blender_zero
                  void (*callback)(nk_block_dev_status_t, void *),
                  void *context)
 {
+    // Note - s is locked
 
     DEBUG("Entered function ata_lba48_read_write_blender_zero\n");
 
@@ -520,20 +533,20 @@ __attribute__((annotate("nohook"))) static int ata_lba48_read_write_blender_zero
 static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *dest,void (*callback)(nk_block_dev_status_t, void *), void *context)
 {
     // return 0;
-    // STATE_LOCK_CONF;
+    STATE_LOCK_CONF;
     struct ata_blkdev_state *s = (struct ata_blkdev_state *)state;
 
     DEBUG("read_blocks on device %s starting at %lu for %lu blocks\n",
 	  s->blkdev->dev.name, blocknum, count);
 
-    // STATE_LOCK(s);
+    STATE_LOCK(s);
     if (blocknum+count >= s->num_blocks) { 
-        // STATE_UNLOCK(s);
+        STATE_UNLOCK(s);
         ERROR("Illegal access past end of disk\n");
         return -1;
     } else {
-        // STATE_UNLOCK(s);
         int rc = ata_lba48_read_write_blender_zero(s, blocknum, count, dest, 0, callback, context);
+        STATE_UNLOCK(s);
 	return rc;
     }
 }
@@ -553,8 +566,8 @@ static int write_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t 
         ERROR("Illegal access past end of disk\n");
         return -1;
     } else {
-        STATE_UNLOCK(s);
         int rc = ata_lba48_read_write_blender_zero(s,blocknum, count, src, 1, callback, context);
+        STATE_UNLOCK(s);
 	return rc;
     }
 }
