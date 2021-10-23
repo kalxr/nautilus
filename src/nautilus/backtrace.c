@@ -82,6 +82,9 @@ nk_stack_dump (ulong_t n)
 void 
 nk_print_regs (struct nk_regs * r)
 {
+    while (1) {
+        
+    }
     int i = 0;
     ulong_t cr0 = 0ul;
     ulong_t cr2 = 0ul;

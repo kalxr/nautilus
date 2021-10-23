@@ -287,7 +287,7 @@ OBJCOPY		= $(CROSS_COMPILE)objcopy
 OBJDUMP		= $(CROSS_COMPILE)objdump
 
 CPP		= $(CC) -E
-GRUBMKRESCUE    = $(CROSS_COMPILE)grub-mkrescue
+GRUBMKRESCUE    = $(CROSS_COMPILE)grub2-mkrescue
 AWK		= awk
 GENKSYMS	= scripts/genksyms/genksyms
 DEPMOD		= /sbin/depmod
