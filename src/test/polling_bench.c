@@ -26,6 +26,7 @@
 #include <nautilus/vc.h>
 #include <nautilus/cpu.h>
 #include <nautilus/libccompat.h>
+#include <dev/apic.h>
 
 #define DO_PRINT       0
 
@@ -784,7 +785,6 @@ int test_pci_config_rdtsc_wrap_loop_asm() {
   return 0;
 }
 
-
 int test_pci_config_rdtsc_within_loop_asm() {
   uint64_t sum = 0;
   uint64_t sum2 = 0;
@@ -830,8 +830,6 @@ int test_pci_config_rdtsc_within_loop_asm() {
   return 0;
 }
 
-
-
 int test_pci_config_rdtscp_wrap_loop_asm() {
   uint64_t diff;
   __asm__ __volatile__(
@@ -858,7 +856,6 @@ int test_pci_config_rdtscp_wrap_loop_asm() {
   nk_vc_printf("test_pci_config_rdtscp_wrap_loop_asm.\n\tAverage cycles: %lu\n", t_avg);
   return 0;
 }
-
 
 int test_pci_config_rdtscp_within_loop_asm() {
   uint64_t sum = 0;
@@ -902,6 +899,78 @@ int test_pci_config_rdtscp_within_loop_asm() {
   uint64_t t_avg = (sum) / IO_ITERATIONS;
   uint64_t variance = (sum2/IO_ITERATIONS) - (t_avg*t_avg);
   nk_vc_printf("test_pci_config_rdtscp_within_loop_asm.\n\tAverage cycles: %lu\n\tMinimum cycle: %lu\n\tVariance: %lu\n", t_avg, min, variance);
+  return 0;
+}
+
+//
+// APIC msr
+//
+
+int test_apic_msr_rdtsc_wrap_loop() {
+  struct apic_dev * apic = per_cpu_get(apic);
+  uint64_t start = rdtsc();
+  for (uint32_t i = 0; i < IO_ITERATIONS; i++) {
+    apic_read(apic, APIC_REG_ID);
+  }
+  uint64_t end = rdtsc();
+  uint64_t t_avg = (end-start) / IO_ITERATIONS;
+  nk_vc_printf("test_apic_msr_rdtsc_wrap_loop.\n\tAverage cycles: %lu\n", t_avg);
+  return 0;
+}
+
+int test_apic_msr_rdtscp_wrap_loop() {
+  struct apic_dev * apic = per_cpu_get(apic);
+  uint64_t start = rdtscp();
+  for (uint32_t i = 0; i < IO_ITERATIONS; i++) {
+    apic_read(apic, APIC_REG_ID);
+  }
+  uint64_t end = rdtscp();
+  uint64_t t_avg = (end-start) / IO_ITERATIONS;
+  nk_vc_printf("test_apic_msr_rdtscp_wrap_loop.\n\tAverage cycles: %lu\n", t_avg);
+  return 0;
+}
+
+int test_apic_msr_rdtsc_within_loop() {
+  struct apic_dev * apic = per_cpu_get(apic);
+  uint64_t sum = 0;
+  uint64_t sum2 = 0;
+  uint64_t min = ~0;
+  uint64_t max = 0;
+  for (uint32_t i = 0; i < IO_ITERATIONS; i++) {
+    uint64_t start = rdtsc();
+    apic_read(apic, APIC_REG_ID);
+    uint64_t end = rdtsc();
+    uint64_t diff = end-start;
+    sum += diff;
+    sum2 += diff*diff;
+    min = diff < min ? diff : min;
+    max = diff > max ? diff : max;
+  }  
+  uint64_t t_avg = (sum) / IO_ITERATIONS;
+  uint64_t variance = (sum2/IO_ITERATIONS) - (t_avg*t_avg);
+  nk_vc_printf("test_apic_msr_rdtsc_within_loop.\n\tAverage cycles: %lu\n\tMinimum cycle: %lu\n\tVariance: %lu\n\tSum: %lu\n\tMax: %lu\n", t_avg, min, variance, sum, max);
+  return 0;
+}
+
+int test_apic_msr_rdtscp_within_loop() {
+  struct apic_dev * apic = per_cpu_get(apic);
+  uint64_t sum = 0;
+  uint64_t sum2 = 0;
+  uint64_t min = ~0;
+  uint64_t max = 0;
+  for (uint32_t i = 0; i < IO_ITERATIONS; i++) {
+    uint64_t start = rdtscp();
+    apic_read(apic, APIC_REG_ID);
+    uint64_t end = rdtscp();
+    uint64_t diff = end-start;
+    sum += diff;
+    sum2 += diff*diff;
+    min = diff < min ? diff : min;
+    max = diff > max ? diff : max;
+  }  
+  uint64_t t_avg = (sum) / IO_ITERATIONS;
+  uint64_t variance = (sum2/IO_ITERATIONS) - (t_avg*t_avg);
+  nk_vc_printf("test_apic_msr_rdtscp_within_loop.\n\tAverage cycles: %lu\n\tMinimum cycle: %lu\n\tVariance: %lu\n\tSum: %lu\n\tMax: %lu\n", t_avg, min, variance, sum, max);
   return 0;
 }
 
@@ -1119,6 +1188,15 @@ static int handle_stats_pci_config(char * buf, void *priv) {
   return 0;
 }
 
+static int handle_stats_apic_msr(char * buf, void *priv) {
+  test_apic_msr_rdtsc_wrap_loop();
+  test_apic_msr_rdtsc_within_loop();
+  test_apic_msr_rdtscp_wrap_loop();
+  test_apic_msr_rdtscp_within_loop();
+
+  return 0;
+}
+
 // Don't put any more here
 static int handle_stats(char * buf, void *priv) {
   test_port_80_rdtsc_wrap_loop();
@@ -1217,6 +1295,12 @@ static struct shell_cmd_impl timing_test = {
   .handler  = handle_timing_test,
 };
 
+static struct shell_cmd_impl io_stats_apic_msr_test = {
+  .cmd      = "io_stats_apic_msr_test",
+  .help_str = "io_stats_apic_msr_test",
+  .handler  = handle_stats_apic_msr,
+};
+
 /******************* Shell Commands *******************/
 
 nk_register_shell_cmd(pmio_arithmetic_test);
@@ -1229,3 +1313,4 @@ nk_register_shell_cmd(io_stats_port_80_test);
 nk_register_shell_cmd(io_stats_lapic_test);
 nk_register_shell_cmd(io_stats_pci_config_test);
 nk_register_shell_cmd(timing_test);
+nk_register_shell_cmd(io_stats_apic_msr_test);
